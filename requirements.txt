@@ -9,3 +9,6 @@ faiss-cpu
 sentence-transformers 
 pandas
 python_dotenv
+fastapi
+uvicorn[standard]
+pydantic
