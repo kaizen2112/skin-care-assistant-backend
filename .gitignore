@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*$py.class
+
+.vscode/
+venv/
+.venv/
+env/
+
+.env
+vectorstore/
+
+
