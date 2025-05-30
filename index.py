@@ -1,3 +1,4 @@
+#index.py
 from ingest import load_products, docs_from_products
 from langchain_huggingface.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
