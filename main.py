@@ -1,65 +1,64 @@
-# # main.py
-# from langchain_core.messages import HumanMessage
-# from chatbot import build_graph
-
-# def main():
-#     graph = build_graph()
-#     state = {"messages": [], "chat_history": []}  # initialize state correctly
-
-#     print("🧑‍⚕️ RAG-powered Skincare Assistant ready! (type exit)\n")
-#     while True:
-#         ui = input("You: ")
-#         if ui.strip().lower() in {"exit", "quit"}:
-#             print("👋 Goodbye!")
-#             break
-
-#         state["messages"].append(HumanMessage(content=ui))
-#         state = graph.invoke(state)
-#         print(f"Specialist: {state['messages'][-1].content}\n")
-
-# if __name__ == "__main__":
-#     main()
-
 # main.py
 import uuid
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Body
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, HTTPException, Body, Path
+from pydantic import BaseModel
+import aiosqlite # Import aiosqlite to manage the connection
+from contextlib import asynccontextmanager
 
-# LangChain message types
-from langchain_core.messages import HumanMessage, AIMessage, BaseMessage # SystemMessage if you plan to log it
+from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
-# Import the globally initialized compiled_graph from chatbot.py
-# This also runs all the global initializations in chatbot.py (LLM, vectorstore etc.)
-try:
-    from chatbot import compiled_graph
-except Exception as e:
-    # Catch errors from chatbot.py initialization (e.g., missing .env, vectorstore)
-    print(f"[main] Critical error during chatbot module import: {e}")
-    print("[main] The application cannot start. Please check configurations and run index.py if needed.")
-    exit(1) # Exit if core components fail to load
+# Import the build function and saver class, NOT a pre-compiled instance
+from chatbot import build_compiled_graph_with_checkpointing, AsyncSqliteSaver
+
+# --- Global variables to hold the graph and checkpointer ---
+# They will be 'None' until the lifespan startup event populates them.
+compiled_graph = None
+checkpointer = None # Add global variable for the checkpointer
+
+# --- Lifespan Manager ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # This code runs on application startup
+    print("[main] Lifespan event: startup")
+    print("[main] Setting up resources...")
+    
+    db_file = "skincare_chat_sessions.sqlite"
+    db_conn = await aiosqlite.connect(db_file)
+    
+    # Make checkpointer global so other functions/endpoints can access it
+    global checkpointer 
+    checkpointer = AsyncSqliteSaver(conn=db_conn)
+    print(f"[main] AsyncSqliteSaver initialized with DB: {db_file}")
+
+    global compiled_graph
+    compiled_graph = build_compiled_graph_with_checkpointing(checkpointer)
+    print("[main] Compiled graph is ready.")
+    
+    yield # The application is now ready to run
+
+    # This code runs on application shutdown
+    print("[main] Lifespan event: shutdown")
+    await db_conn.close()
+    print("[main] Database connection closed.")
 
 
+# --- FastAPI App Initialization ---
 app = FastAPI(
-    title="Skincare RAG API",
-    description="API for interacting with the RAG-powered Skincare Assistant. Manage sessions using session_id.",
-    version="1.0.0"
+    title="Skincare RAG API with Persistent Sessions",
+    description="API for Skincare Assistant. Sessions are persistent via SQLite.",
+    version="1.3.1", # Incremented version for logging change
+    lifespan=lifespan
 )
 
-# --- Session Management ---
-# WARNING: In-memory storage. Resets on server restart. For production, use Redis, a DB, etc.
-user_sessions: Dict[str, Dict[str, Any]] = {}
-# Structure: session_id -> {"messages": List[BaseMessage], "chat_history": List[Tuple[BaseMessage, BaseMessage]]}
-
-# --- Pydantic Models for API ---
+# --- Pydantic Models ---
 class ApiChatMessageInput(BaseModel):
     content: str
-    # type: str = Field("human", const=True) # Ensuring it's always human from input
 
 class ApiChatMessageOutput(BaseModel):
     content: str
-    type: str # "human", "ai", "system"
+    type: str # "human", "ai"
 
 class ChatRequest(BaseModel):
     session_id: Optional[str] = None
@@ -69,138 +68,126 @@ class ChatResponse(BaseModel):
     session_id: str
     response_message: ApiChatMessageOutput
     full_chat_log: List[ApiChatMessageOutput]
-    # Optional: include source documents if your retrieval_chain returns them and you want to expose them
-    # source_documents: Optional[List[Dict]] = None
 
-# Helper to convert LangChain BaseMessage to Pydantic model for API response
+class ChatHistoryResponse(BaseModel):
+    session_id: str
+    chat_history: List[ApiChatMessageOutput]
+    raw_state: Optional[Dict[str, Any]] = None # Optional: for debugging the full state
+
+# Helper function (remains the same)
 def convert_lc_message_to_api_output(message: BaseMessage) -> ApiChatMessageOutput:
     msg_type = "unknown"
     if isinstance(message, HumanMessage):
         msg_type = "human"
     elif isinstance(message, AIMessage):
         msg_type = "ai"
-    # Add SystemMessage if you intend to include them in full_chat_log
-    # elif isinstance(message, SystemMessage):
-    #     msg_type = "system"
+    # Add other types if you log them, e.g., SystemMessage
     return ApiChatMessageOutput(content=str(message.content), type=msg_type)
 
-@app.on_event("startup")
-async def startup_event():
-    # This event is triggered when FastAPI starts up.
-    # The import of `compiled_graph` from `chatbot` already initializes components.
-    print("[main] FastAPI startup: Skincare Assistant API is ready.")
-    if compiled_graph:
-        print("[main] Compiled LangGraph loaded successfully.")
-    else:
-        print("[main] ERROR: Compiled LangGraph is not available. The application might not work.")
 
-
+# --- API Endpoints ---
 @app.post("/chat", response_model=ChatResponse)
 async def chat_with_assistant(request: ChatRequest = Body(...)):
-    """
-    Handles a chat message from the user.
-    Manages conversation state using a session_id.
-    """
-    session_id = request.session_id
-    
-    if not session_id or session_id not in user_sessions:
-        session_id = str(uuid.uuid4())
-        # Initialize state for a new session
-        user_sessions[session_id] = {
-            "messages": [],       # For LangGraph's `State.messages` (full log of HumanMessage, AIMessage)
-            "chat_history": []    # For `ConversationalRetrievalChain` (list of (Human, AI) message tuples)
-        }
-        print(f"[main] New session started: {session_id}")
+    if compiled_graph is None or checkpointer is None: # Also check checkpointer
+        raise HTTPException(status_code=503, detail="Service Unavailable: Core components not initialized.")
 
-    current_session_data = user_sessions[session_id]
-    
-    # Append new user message to the session's "messages" log (for LangGraph)
-    user_lc_message = HumanMessage(content=request.message.content)
-    current_session_data["messages"].append(user_lc_message)
+    session_id = request.session_id or str(uuid.uuid4())
+    print(f"[main] Handling POST /chat for session_id: {session_id}")
 
-    # Prepare state for the LangGraph graph invocation
-    # The graph's `State` TypedDict expects `messages` and `chat_history`.
-    # `add_messages` in `State.messages` means the graph appends to this list.
-    graph_input_state = {
-        "messages": [user_lc_message], # Pass only the new message due to `add_messages` behavior
-                                       # LangGraph will combine it with checkpointed messages.
-        "chat_history": list(current_session_data["chat_history"]) # Pass current RAG history
-    }
-    
-    # Configuration for invoking the graph, ensuring it uses the correct checkpoint for this session
-    # LangGraph handles checkpointing internally if a checkpointer is configured.
-    # For a simple in-memory approach without explicit checkpointer, we manage the full state.
-    # If `add_messages` is used, graph needs the running list of messages.
-    # Let's pass the full current list of messages, and rag_node should expect this via state['messages']
-    # and the AIMessage it returns will be appended by add_messages.
-    
-    # Correction based on `add_messages` and LangGraph's handling:
-    # The graph state is maintained by LangGraph. We provide new inputs to the existing state.
-    # The `compiled_graph.invoke` call takes the *current inputs* and a *configuration*
-    # that tells it which conversation (checkpoint) to use.
-    # For our manual session management, we're effectively managing the checkpoint data ourselves.
-
-    # Let's ensure the `graph_input_state` aligns with what `rag_node` and `State` expect.
-    # `State.messages` uses `add_messages`.
-    # When invoking graph, if we pass `{"messages": [new_human_message]}`,
-    # LangGraph appends this to the existing messages in the checkpoint for that session.
-    # The `rag_node` then receives the full list in `state["messages"]`.
-    
-    # The state for the graph will be the current accumulated state for the session.
-    # LangGraph's StateGraph.compile() returns a `CompiledGraph`.
-    # Invoking it with the full state dictionary for that "thread" (session) should work.
-    
-    # Let's try passing the full current state, graph will use it.
-    full_graph_input_state_for_session = {
-        "messages": list(current_session_data["messages"]), # Full log for this session
-        "chat_history": list(current_session_data["chat_history"]) # Current RAG history
-    }
+    graph_input = {"messages": [HumanMessage(content=request.message.content)]}
+    config = {"configurable": {"thread_id": session_id}}
 
     try:
-        # Invoke the graph. It operates on the state.
-        # The result_state will contain the complete updated state for this session.
-        result_state = compiled_graph.invoke(full_graph_input_state_for_session)
-        
+        result_state = await compiled_graph.ainvoke(graph_input, config=config)
     except Exception as e:
-        print(f"[main] Error invoking graph for session {session_id}: {e}")
-        # Consider logging the `full_graph_input_state_for_session` for debugging
+        print(f"[main] Error invoking graph for session_id {session_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Error processing your request: {str(e)}")
 
-    # Update our session data with the full state returned by the graph
-    user_sessions[session_id]["messages"] = result_state["messages"]
-    user_sessions[session_id]["chat_history"] = result_state["chat_history"]
-
-    # The last message in the `result_state["messages"]` should be the AI's response
-    ai_response_lc_message = result_state["messages"][-1] if result_state["messages"] else AIMessage(content="No response generated.")
-    
-    # Prepare API response
-    api_chat_log = [convert_lc_message_to_api_output(msg) for msg in result_state["messages"]]
+    if not result_state or "messages" not in result_state or not result_state["messages"]:
+        # Handle case where graph might not return expected messages
+        print(f"[main] Warning: Graph for session {session_id} returned unexpected state: {result_state}")
+        # You might want to return a more specific error or an empty log
+        ai_response_lc_message = AIMessage(content="Sorry, an issue occurred with processing the conversation.")
+        api_chat_log = [convert_lc_message_to_api_output(ai_response_lc_message)]
+    else:
+        ai_response_lc_message = result_state["messages"][-1]
+        api_chat_log = [convert_lc_message_to_api_output(msg) for msg in result_state["messages"]]
     
     return ChatResponse(
         session_id=session_id,
         response_message=convert_lc_message_to_api_output(ai_response_lc_message),
         full_chat_log=api_chat_log
-        # source_documents=result_state.get("source_documents") # If you add this to graph output
     )
 
-# To run (ensure .env is in the same directory or vars are set):
-# uvicorn main:app --reload --host 0.0.0.0 --port 8000
-#
-# Example request using curl:
-# curl -X POST "http://localhost:8000/chat" \
-# -H "Content-Type: application/json" \
-# -d '{
-# "session_id": "my-test-session-123",
-# "message": {
-# "content": "Hi, what are some good moisturizers for dry skin?"
-# }
-# }'
-#
-# For a new session (omit session_id or send a new one):
-# curl -X POST "http://localhost:8000/chat" \
-# -H "Content-Type: application/json" \
-# -d '{
-# "message": {
-# "content": "Hello there!"
-# }
-# }'
+@app.get("/chat_history/{session_id}", response_model=ChatHistoryResponse)
+async def get_chat_history(session_id: str = Path(..., description="The ID of the session to retrieve chat history for.")):
+    """
+    Retrieves the full chat history for a given session ID.
+    """
+    if checkpointer is None:
+        raise HTTPException(status_code=503, detail="Service Unavailable: Checkpointer not initialized.")
+
+    print(f"[main] Handling GET /chat_history for session_id: {session_id}")
+    config = {"configurable": {"thread_id": session_id}}
+
+    try:
+        # Use the checkpointer's 'aget' method to retrieve the saved state (checkpoint)
+        saved_state = await checkpointer.aget(config=config)
+        # --- DEBUG LOGGING ADDED ---
+        print(f"[main DEBUG] Raw saved_state for session {session_id} from checkpointer.aget(): {saved_state}")
+        # --- END DEBUG LOGGING ---
+    except Exception as e:
+        # This might happen if there's an issue with the DB connection or checkpointer logic
+        print(f"[main] Error retrieving state for session_id {session_id} from checkpointer: {e}")
+        raise HTTPException(status_code=500, detail=f"Error retrieving chat history: {str(e)}")
+
+    if saved_state is None:
+        print(f"[main DEBUG] No saved_state found for session {session_id}. Returning 404.") # DEBUG LOGGING
+        raise HTTPException(status_code=404, detail=f"Chat history not found for session_id: {session_id}")
+
+    # The saved_state is a dictionary representing the LangGraph State.
+    # We need to extract the 'messages' list.
+    messages_from_state = saved_state.get("messages", [])
+    # --- DEBUG LOGGING ADDED ---
+    print(f"[main DEBUG] Extracted 'messages_from_state' for session {session_id}: {messages_from_state}")
+    if not messages_from_state:
+        print(f"[main DEBUG] 'messages_from_state' is empty for session {session_id}.")
+    # --- END DEBUG LOGGING ---
+    
+    if not isinstance(messages_from_state, list):
+        print(f"[main] Warning: 'messages' in saved state for session {session_id} is not a list: {messages_from_state}")
+        api_chat_log = []
+    else:
+        api_chat_log = []
+        for i, msg_data in enumerate(messages_from_state):
+            # --- DEBUG LOGGING ADDED ---
+            print(f"[main DEBUG] Processing message {i} from state: {msg_data} (type: {type(msg_data)})")
+            # --- END DEBUG LOGGING ---
+            if isinstance(msg_data, BaseMessage):
+                api_chat_log.append(convert_lc_message_to_api_output(msg_data))
+            elif isinstance(msg_data, dict): 
+                if "content" in msg_data and "type" in msg_data:
+                    if msg_data["type"] == "human":
+                        api_chat_log.append(convert_lc_message_to_api_output(HumanMessage(content=msg_data["content"])))
+                    elif msg_data["type"] == "ai":
+                        api_chat_log.append(convert_lc_message_to_api_output(AIMessage(content=msg_data["content"])))
+                    else: 
+                        print(f"[main DEBUG] Message {i} is dict with unknown type: {msg_data['type']}") # DEBUG
+                        api_chat_log.append(ApiChatMessageOutput(content=str(msg_data.get("content")), type="dict_unknown"))
+                else: 
+                    print(f"[main DEBUG] Message {i} is dict with unexpected structure: {msg_data}") # DEBUG
+                    api_chat_log.append(ApiChatMessageOutput(content=str(msg_data), type="raw_dict"))
+            else: 
+                print(f"[main DEBUG] Message {i} has unknown format: {msg_data}") # DEBUG
+                api_chat_log.append(ApiChatMessageOutput(content=str(msg_data), type="unknown_format"))
+        # --- DEBUG LOGGING ADDED ---
+        print(f"[main DEBUG] Final 'api_chat_log' for session {session_id}: {api_chat_log}")
+        # --- END DEBUG LOGGING ---
+
+    include_raw_state = True # Temporarily set to True for debugging the raw state via API response
+
+    return ChatHistoryResponse(
+        session_id=session_id,
+        chat_history=api_chat_log,
+        raw_state=saved_state if include_raw_state else None
+    )

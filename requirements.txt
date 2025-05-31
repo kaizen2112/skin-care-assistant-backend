@@ -12,3 +12,4 @@ python_dotenv
 fastapi
 uvicorn[standard]
 pydantic
+aiosqlite
